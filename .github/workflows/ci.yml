@@ -16,16 +16,11 @@ defaults:
     shell: bash
 
 env:
-  # Node versions exercised by every matrix job.
-  NODE_VERSIONS: [18, 20, 22]
   # Directory used for Turbo's local build cache.
   TURBO_CACHE_DIR: .turbo
 
 # ---------------------------------------------------------------------------
-# Jobs run on self-hosted Linux runners where possible. If no self-hosted
-# runners are registered for this repository, jobs will pend until one is
-# available; change `runs-on: ubuntu-latest` to `ubuntu-latest` to use
-# GitHub-hosted runners instead.
+# Jobs run on GitHub-hosted ubuntu-latest runners.
 # ---------------------------------------------------------------------------
 
 jobs:

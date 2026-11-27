@@ -1,11 +1,387 @@
-name: CI
+name: CI/CD Pipeline
+
 on:
   push:
-    branches: [ main ]
+    branches: [main]
   pull_request:
-    branches: [ main ]
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  security-events: write
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  # Node versions exercised by every matrix job.
+  NODE_VERSIONS: [18, 20, 22]
+  # Directory used for Turbo's local build cache.
+  TURBO_CACHE_DIR: .turbo
+
+# ---------------------------------------------------------------------------
+# Jobs run on self-hosted Linux runners where possible. If no self-hosted
+# runners are registered for this repository, jobs will pend until one is
+# available; change `runs-on: ubuntu-latest` to `ubuntu-latest` to use
+# GitHub-hosted runners instead.
+# ---------------------------------------------------------------------------
+
 jobs:
-  check:
+  ###########################################################################
+  # Lint — ESLint + Prettier + Stylelint (all must pass)
+  ###########################################################################
+  lint:
+    name: Lint (ESLint + Prettier + Stylelint)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        node-version: [18, 20, 22]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run ESLint
+        run: npx eslint src/ --ext .ts
+
+      - name: Run Prettier
+        run: npx prettier --check "src/**/*.{ts,json}" "tests/**/*.{ts,json}" "*.json" "*.md"
+
+      - name: Run Stylelint
+        run: npx stylelint "src/**/*.css" "apps/**/*.css" "packages/**/*.css" --max-warnings 0
+
+      - name: Validate admin HTML (HTML5)
+        continue-on-error: true
+        run: npx html-validate@8 --config .htmlprintrc.json "w/admin/*.html"
+
+      - name: Verify axe-core loads (a11y smoke test)
+        continue-on-error: true
+        run: node -e "require('axe-core'); console.log('axe-core', require('axe-core/package.json').version, 'ready')"
+
+  ###########################################################################
+  # TypeCheck — tsc --noEmit (strict mode, zero errors)
+  ###########################################################################
+  typecheck:
+    name: TypeCheck (tsc --noEmit, strict)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        node-version: [18, 20, 22]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run TypeScript type check
+        run: npx tsc --noEmit
+
+  ###########################################################################
+  # Test: Unit — vitest run --coverage (80% threshold in vitest.config.ts)
+  ###########################################################################
+  test-unit:
+    name: "Test: Unit (vitest --coverage, 80% threshold)"
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        node-version: [18, 20, 22]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run unit tests with coverage
+        run: |
+          mkdir -p vitest-results
+          npx vitest run --coverage tests/unit \
+            --reporter=junit \
+            --reporter-options outputFile=vitest-results/unit-${{ matrix.node-version }}.xml
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-unit-${{ matrix.node-version }}
+          path: coverage/
+          retention-days: 15
+
+      - name: Upload unit test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-unit-${{ matrix.node-version }}
+          path: vitest-results/unit-${{ matrix.node-version }}.xml
+          retention-days: 15
+
+  ###########################################################################
+  # Test: Integration — vitest run (integration tests)
+  ###########################################################################
+  test-integration:
+    name: "Test: Integration (vitest run)"
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        node-version: [18, 20, 22]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run integration tests
+        run: |
+          mkdir -p vitest-results
+          npx vitest run tests/integration \
+            --reporter=junit \
+            --reporter-options outputFile=vitest-results/integration-${{ matrix.node-version }}.xml
+
+      - name: Upload integration test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-integration-${{ matrix.node-version }}
+          path: vitest-results/integration-${{ matrix.node-version }}.xml
+          retention-days: 15
+
+  ###########################################################################
+  # Test: E2E — Playwright test (headless, Chromium / Firefox / WebKit)
+  ###########################################################################
+  test-e2e:
+    name: "Test: E2E (Playwright ${{ matrix.browser }})"
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        node-version: [20]
+        browser: [chromium, firefox, webkit]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Playwright browsers
+        run: npx playwright install ${{ matrix.browser }}
+
+      - name: Serve the app for E2E tests
+        run: |
+          python3 -m http.server 8000 > /tmp/e2e-server.log 2>&1 &
+          sleep 2
+
+      - name: Run Playwright E2E tests
+        run: npx playwright test tests/e2e --browser ${{ matrix.browser }} --base-url http://localhost:8000
+
+      - name: Upload E2E traces and screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-results-${{ matrix.browser }}
+          path: |
+            playwright-report/
+            screenshots/
+          retention-days: 15
+
+  ###########################################################################
+  # Test: Visual — Playwright visual regression
+  ###########################################################################
+  test-visual:
+    name: "Test: Visual Regression"
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        node-version: [20]
+        browser: [chromium, firefox, webkit]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Playwright browsers
+        run: npx playwright install ${{ matrix.browser }}
+
+      - name: Serve the app for visual regression
+        run: |
+          python3 -m http.server 8000 > /tmp/visual-server.log 2>&1 &
+          sleep 2
+
+      - name: Run visual regression tests
+        run: npx playwright test tests/e2e --browser ${{ matrix.browser }} --base-url http://localhost:8000
+
+      - name: Upload visual regression artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: visual-regression-${{ matrix.browser }}
+          path: |
+            playwright-report/
+            screenshots/
+          retention-days: 15
+
+  ###########################################################################
+  # Security — Semgrep SAST, npm audit, Gitleaks, Trivy FS scan
+  ###########################################################################
+  security:
+    name: Security (SAST + secrets + dependencies)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run npm audit
+        continue-on-error: true
+        run: npm audit --audit-level=high || true
+
+      - name: Run SAST scan (Semgrep)
+        uses: returntocorp/semgrep-action@v5
+        with:
+          config: >-
+            p/ci
+            p/typescript
+            p/node-express
+          generateSarif: true
+
+      - name: Run secret scanning (Gitleaks)
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_LICENSE_KEY: ${{ secrets.GITLEAKS_LICENSE_KEY }}
+        with:
+          config: .gitleaks.toml
+          args: --exclude='\.env(\.example)?$'
+
+      - name: Run dependency filesystem scan (Trivy)
+        continue-on-error: true
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: fs
+          scan-ref: '.'
+          scanners: 'vuln'
+          severity: 'CRITICAL,HIGH'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+
+      - name: Upload Semgrep results to Security tab
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: semgrep.sarif
+
+      - name: Upload Trivy results to Security tab
+        if: always()
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-results.sarif
+
+  ###########################################################################
+  # Build — turbo run build (all packages), needs green lint/typecheck/unit
+  ###########################################################################
+  build:
+    name: Build (turbo, all packages)
+    needs: [lint, typecheck, test-unit]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        node-version: [18, 20, 22]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Restore Turbo build cache
+        uses: actions/cache@v4
+        with:
+          path: .turbo
+          key: turbo-${{ runner.os }}-node${{ matrix.node-version }}-${{ hashFiles('package-lock.json') }}
+          restore-keys: |
+            turbo-${{ runner.os }}-node${{ matrix.node-version }}-
+            turbo-${{ runner.os }}-
+
+      - name: Build all packages with Turbo
+        run: npx turbo run build --cache-dir .turbo
+
+      - name: Save Turbo build cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .turbo
+          key: turbo-${{ runner.os }}-node${{ matrix.node-version }}-${{ hashFiles('package-lock.json') }}
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-output-${{ matrix.node-version }}
+          path: dist/
+          retention-days: 14

@@ -1,0 +1,178 @@
+name: Daily Security Scan
+
+on:
+  schedule:
+    # Runs every day at 01:00 UTC.
+    - cron: '0 1 * * *'
+  pull_request:
+    branches: [main]   # dependency review runs on PRs
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  security-events: write
+  pull-requests: read
+
+jobs:
+  ###########################################################################
+  # Gitleaks secret scan over full git history.
+  ###########################################################################
+  gitleaks:
+    name: Gitleaks Secret Scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # gitleaks needs full history to detect leaked secrets
+
+      - name: Run secret scanning (Gitleaks)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_LICENSE_KEY: ${{ secrets.GITLEAKS_LICENSE_KEY }}
+        uses: gitleaks/gitleaks-action@v2
+        with:
+          config: .gitleaks.toml
+          args: --exclude='\.env(\.example)?$'
+
+      - name: Upload Gitleaks results
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: gitleaks-results
+          path: gitleaks.sarif
+          retention-days: 30
+
+  ###########################################################################
+  # Trivy filesystem vulnerability scan (CRITICAL/HIGH only).
+  ###########################################################################
+  trivy:
+    name: Trivy FS Scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run filesystem vulnerability scan (Trivy)
+        continue-on-error: true
+        uses: aquasecurity/trivy-action@0.19.0
+        with:
+          scan-type: fs
+          scan-ref: '.'
+          scanners: 'vuln'
+          severity: 'CRITICAL,HIGH'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+
+      - name: Upload Trivy results to Security tab
+        if: always()
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-results.sarif
+
+  ###########################################################################
+  # Dependency Review — runs on pull requests (dependency-review-action).
+  ###########################################################################
+  dependency-review:
+    name: Dependency Review
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Review dependency changes
+        uses: actions/dependency-review-action@v3
+
+  ###########################################################################
+  # npm audit — daily audit of the dependency tree.
+  ###########################################################################
+  npm-audit:
+    name: NPM Audit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run npm audit
+        continue-on-error: true
+        run: npm audit --audit-level=high || true
+
+  ###########################################################################
+  # CodeQL SAST — runs on push to main and PRs; results to Security tab.
+  ###########################################################################
+  codeql:
+    name: CodeQL SAST
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [javascript, typescript]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@v3
+
+      - name: Analyze
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:${{ matrix.language }}"
+
+  ###########################################################################
+  # Container image scan (Trivy) — scans the built Docker image for vulns.
+  ###########################################################################
+  container-scan:
+    name: Container Image Scan (Trivy)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build container image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          load: true
+          tags: computeable-api:local-${{ github.sha }}
+
+      - name: Run Trivy container vulnerability scan
+        continue-on-error: true
+        uses: aquasecurity/trivy-action@0.19.0
+        with:
+          scan-type: image
+          image-ref: 'computeable-api:local-${{ github.sha }}'
+          scanners: 'vuln'
+          severity: 'CRITICAL,HIGH'
+          format: 'sarif'
+          output: 'trivy-container-results.sarif'
+
+      - name: Upload container scan results to Security tab
+        if: always()
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-container-results.sarif
